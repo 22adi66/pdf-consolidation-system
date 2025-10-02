@@ -303,8 +303,11 @@ class PDFConsolidator:
             
             print(f"\n   📑 Bookmark: '{bookmark_name}'")
             
-            # Find matching bookmark tracker (fuzzy matching)
-            tracker_key = self.find_matching_bookmark(bookmark_name)
+            # Get the first modified page to help identify the specific bookmark instance
+            first_modified_page = page_changes[0][1] + 1  # Convert to 1-based
+            
+            # Find matching bookmark tracker using the specific page number
+            tracker_key = self.find_matching_bookmark(bookmark_name, first_modified_page)
             
             if tracker_key is None:
                 print(f"      ⚠️  No matching bookmark found (creating new)")
@@ -322,15 +325,34 @@ class PDFConsolidator:
                     print(f"      🔄 Bookmark name updated: '{tracker.current_name}' → '{bookmark_name}'")
                     tracker.update_name(bookmark_name)
             
-            # Get ALL pages that belong to this bookmark from source PDF
-            from comparison_engine_core import create_page_to_bookmark_map
-            source_bookmark_map = create_page_to_bookmark_map(source_reader)
+            # Get pages from source PDF that belong to THIS SPECIFIC bookmark instance
+            # We need to find the page range of this bookmark instance in the source PDF
+            from comparison_engine_core import extract_bookmark_list
+            source_bookmarks = extract_bookmark_list(source_reader)
             
-            # Find all pages for this bookmark in source PDF
+            # Find the bookmark instance that contains the modified page
+            bookmark_start_page = None
+            bookmark_end_page = None
+            for idx, (bm_name, bm_page) in enumerate(source_bookmarks):
+                if bm_name == bookmark_name and bm_page <= first_modified_page:
+                    bookmark_start_page = bm_page
+                    # Find the end page (next bookmark or end of PDF)
+                    if idx + 1 < len(source_bookmarks):
+                        bookmark_end_page = source_bookmarks[idx + 1][1] - 1
+                    else:
+                        bookmark_end_page = len(source_reader.pages)
+                    
+                    # Check if our modified page falls in this range
+                    if bookmark_start_page <= first_modified_page <= bookmark_end_page:
+                        break
+            
+            # Get all pages in this specific bookmark instance
             all_bookmark_pages = []
-            for page_num in range(1, len(source_bookmark_map)):
-                if source_bookmark_map[page_num] == bookmark_name:
-                    all_bookmark_pages.append(page_num)
+            if bookmark_start_page and bookmark_end_page:
+                all_bookmark_pages = list(range(bookmark_start_page, bookmark_end_page + 1))
+            else:
+                # Fallback: just use the modified page
+                all_bookmark_pages = [first_modified_page]
             
             if not all_bookmark_pages:
                 print(f"      ⚠️  Could not find pages for bookmark in source PDF")
