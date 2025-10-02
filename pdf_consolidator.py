@@ -110,9 +110,13 @@ class PDFConsolidator:
         normalized = ''.join(c for c in normalized if c.isalnum() or c.isspace())
         return ' '.join(normalized.split())
     
-    def find_matching_bookmark(self, bookmark_name: str) -> Optional[str]:
+    def find_matching_bookmark(self, bookmark_name: str, page_number: Optional[int] = None) -> Optional[str]:
         """
         Find a matching bookmark using fuzzy matching.
+        
+        Args:
+            bookmark_name: The bookmark name to search for
+            page_number: Optional page number to help find exact bookmark instance
         
         Returns the key of the matching bookmark tracker, or None.
         """
@@ -127,6 +131,16 @@ class PDFConsolidator:
             # Check current name
             normalized_current = self.normalize_bookmark_name(tracker.current_name)
             ratio = SequenceMatcher(None, normalized_target, normalized_current).ratio()
+            
+            # If page_number is provided and names match, prefer the tracker that contains this page
+            if page_number and ratio > 0.95:  # Names are very similar
+                # Check if this page falls within this tracker's range
+                if tracker.versions:
+                    first_version = tracker.versions[0]
+                    start, end = first_version.page_range
+                    if start <= page_number <= end:
+                        # Exact match with page in range - use this immediately
+                        return tracker_key
             
             if ratio > best_ratio:
                 best_ratio = ratio
@@ -182,9 +196,10 @@ class PDFConsolidator:
         
         print(f"   Base PDF has {total_pages} pages")
         
-        # Extract bookmarks from base PDF
-        from comparison_engine_core import create_page_to_bookmark_map
-        bookmark_map = create_page_to_bookmark_map(base_reader)
+        # Extract bookmarks directly from base PDF outline
+        # This preserves ALL bookmarks including those with duplicate names
+        from comparison_engine_core import extract_bookmark_list
+        bookmark_list = extract_bookmark_list(base_reader)
         
         # Copy all pages from base PDF
         for page_num in range(total_pages):
@@ -193,20 +208,24 @@ class PDFConsolidator:
             self.current_page_count += 1
         
         print(f"   ✅ Copied {total_pages} pages to consolidated PDF")
-        
-        # Group pages by bookmark and create Version 1
-        bookmark_pages: Dict[str, List[int]] = defaultdict(list)
-        for page_num in range(1, len(bookmark_map)):
-            bookmark_name = bookmark_map[page_num]
-            bookmark_pages[bookmark_name].append(page_num)
-        
-        print(f"   📑 Found {len(bookmark_pages)} unique bookmarks")
+        print(f"   📑 Found {len(bookmark_list)} bookmarks")
+        print(f"   ℹ️  Note: Some bookmarks may have the same name but different page ranges")
         print()
         
-        # Create bookmark trackers with Version 1
-        for bookmark_name, pages in bookmark_pages.items():
-            if bookmark_name == "(No Bookmark)":
-                continue
+        # Create bookmark trackers with Version 1 for each bookmark
+        # Group consecutive bookmarks to determine page ranges
+        i = 0
+        while i < len(bookmark_list):
+            bookmark_name, start_page = bookmark_list[i]
+            
+            # Determine end page: it's either the page before the next bookmark, or the last page
+            if i + 1 < len(bookmark_list):
+                end_page = bookmark_list[i + 1][1] - 1
+            else:
+                end_page = total_pages
+            
+            # Get pages in this range
+            pages = list(range(start_page, end_page + 1))
             
             # Calculate content hash for these pages
             page_indices = [p - 1 for p in pages]  # Convert to 0-based
@@ -215,7 +234,7 @@ class PDFConsolidator:
             # Create Version 1
             version_1 = BookmarkVersion(
                 version_number=1,
-                page_range=(min(pages), max(pages)),
+                page_range=(start_page, end_page),
                 source_pdf=self.base_pdf_path,
                 source_pages=pages,
                 content_hash=content_hash
@@ -228,11 +247,14 @@ class PDFConsolidator:
             )
             tracker.add_version(version_1)
             
-            # Use normalized name as key for consistent lookup
-            tracker_key = self.normalize_bookmark_name(bookmark_name)
+            # Use page range as part of the key to distinguish duplicate bookmark names
+            # Format: "normalized_name|start_page"
+            tracker_key = f"{self.normalize_bookmark_name(bookmark_name)}|{start_page}"
             self.bookmark_trackers[tracker_key] = tracker
             
-            print(f"   📌 {bookmark_name}: Pages {min(pages)}-{max(pages)} ({len(pages)} pages)")
+            print(f"   📌 {bookmark_name}: Pages {start_page}-{end_page} ({len(pages)} pages)")
+            
+            i += 1
         
         print()
         print(f"✅ Base PDF initialized with {len(self.bookmark_trackers)} bookmarks")
@@ -369,35 +391,57 @@ class PDFConsolidator:
             print(f"\n🆕 Processing NEW bookmarks from added pages")
             print("─" * 80)
             
-            # Group added pages by bookmark
-            added_by_bookmark: Dict[str, List[int]] = defaultdict(list)
-            for page_idx in unmatched2:
-                page_num = page_idx + 1
-                bookmark_name = bookmark_map2[page_num] if page_num < len(bookmark_map2) else "(No Bookmark)"
-                added_by_bookmark[bookmark_name].append(page_num)
+            # Extract ALL bookmarks from source PDF to identify new instances
+            from comparison_engine_core import extract_bookmark_list
+            source_bookmarks = extract_bookmark_list(source_reader)
             
-            # Process each new bookmark
-            for bookmark_name, added_pages in added_by_bookmark.items():
-                if bookmark_name == "(No Bookmark)":
-                    continue
+            # Find NEW bookmark instances (those that don't have a tracker yet)
+            for bookmark_name, page_num in source_bookmarks:
+                # Check if any of the added pages belong to this bookmark
+                if (page_num - 1) not in unmatched2:
+                    continue  # This bookmark doesn't contain any added pages
                 
-                # Check if this bookmark already exists (fuzzy match)
-                tracker_key = self.find_matching_bookmark(bookmark_name)
+                # Check if we already have a tracker for this specific bookmark instance
+                # by checking if any tracker covers this page number
+                tracker_key = self.find_matching_bookmark(bookmark_name, page_num)
                 
-                if tracker_key is not None:
-                    # Bookmark exists, skip (already handled in modified section)
-                    continue
+                # Also check if this exact bookmark instance was already processed
+                already_exists = False
+                for t_key, tracker in self.bookmark_trackers.items():
+                    if tracker.current_name == bookmark_name:
+                        # Check if this is the same instance by checking source pages
+                        for version in tracker.versions:
+                            if page_num in version.source_pages and version.source_pdf == source_pdf_path:
+                                already_exists = True
+                                break
+                    if already_exists:
+                        break
                 
-                print(f"\n   🆕 NEW Bookmark: '{bookmark_name}'")
+                if already_exists:
+                    continue  # This bookmark instance was already added
                 
-                # Get ALL pages for this NEW bookmark from source PDF
-                from comparison_engine_core import create_page_to_bookmark_map
-                source_bookmark_map = create_page_to_bookmark_map(source_reader)
+                print(f"\n   🆕 NEW Bookmark Instance: '{bookmark_name}' (starting at page {page_num})")
                 
+                # Get ALL pages for this specific bookmark instance from source PDF
+                # Find the range of pages for this bookmark instance
                 all_bookmark_pages = []
-                for page_num in range(1, len(source_bookmark_map)):
-                    if source_bookmark_map[page_num] == bookmark_name:
-                        all_bookmark_pages.append(page_num)
+                bookmark_start_page = page_num
+                
+                # Find where this bookmark instance ends
+                # It ends when we encounter a different bookmark or reach the end
+                for i, (bm_name, bm_page) in enumerate(source_bookmarks):
+                    if bm_name == bookmark_name and bm_page == bookmark_start_page:
+                        # Found the start - now find the end
+                        if i + 1 < len(source_bookmarks):
+                            # End is just before the next bookmark
+                            bookmark_end_page = source_bookmarks[i + 1][1] - 1
+                        else:
+                            # This is the last bookmark - goes to end of PDF
+                            bookmark_end_page = len(source_reader.pages)
+                        
+                        # Collect all pages in this range
+                        all_bookmark_pages = list(range(bookmark_start_page, bookmark_end_page + 1))
+                        break
                 
                 if not all_bookmark_pages:
                     print(f"      ⚠️  Could not find pages for new bookmark in source PDF")
@@ -407,28 +451,55 @@ class PDFConsolidator:
                 all_page_indices = [p - 1 for p in all_bookmark_pages]
                 content_hash = self.calculate_content_hash(source_reader, all_page_indices)
                 
-                # Insert pages at the END of consolidated PDF
-                insert_position = self.current_page_count
+                # Find the correct insertion position based on the bookmark's position in source PDF
+                # We want to maintain the order from the source PDF
+                # Find the bookmark that comes BEFORE this one in the source PDF
+                insert_position = self.current_page_count  # Default: insert at end
+                
+                for i, (bm_name, bm_page) in enumerate(source_bookmarks):
+                    if bm_name == bookmark_name and bm_page == bookmark_start_page:
+                        # Found our bookmark - check what comes before it
+                        if i > 0:
+                            prev_bookmark_name, prev_bookmark_page = source_bookmarks[i - 1]
+                            # Find this previous bookmark in our consolidated PDF
+                            for t_key, t in self.bookmark_trackers.items():
+                                if t.current_name == prev_bookmark_name:
+                                    # Insert after the last version of this previous bookmark
+                                    last_version = t.versions[-1]
+                                    insert_position = last_version.page_range[1]
+                                    break
+                        break
+                
                 start_page = insert_position + 1
                 
                 # Copy ALL pages of the new bookmark
                 pages_inserted = 0
                 for page_idx in all_page_indices:
                     page = source_reader.pages[page_idx]
-                    self.writer.add_page(page)
+                    self.writer.insert_page(page, insert_position + pages_inserted)
                     pages_inserted += 1
                 
+                # Update current page count
                 self.current_page_count += pages_inserted
-                end_page = self.current_page_count
                 
-                # Create NEW bookmark tracker with Version 1
-                tracker_key = self.normalize_bookmark_name(bookmark_name)
+                # Update page ranges for all subsequent versions in ALL bookmarks
+                for t_key, t in self.bookmark_trackers.items():
+                    for v in t.versions:
+                        if v.page_range[0] > insert_position:
+                            v.page_range = (v.page_range[0] + pages_inserted, v.page_range[1] + pages_inserted)
+                
+                end_page = start_page + pages_inserted - 1
+                
+                # Create NEW bookmark tracker (simple bookmark, NO version children)
+                # Use page number in key to distinguish duplicate bookmark names
+                tracker_key = f"{self.normalize_bookmark_name(bookmark_name)}|{start_page}"
                 tracker = BookmarkTracker(
                     current_name=bookmark_name,
                     original_name=bookmark_name
                 )
                 
-                # Add Version 1 for this new bookmark
+                # Add as Version 1 (but DON'T mark as having changes)
+                # This way it will be rendered as a simple bookmark without version children
                 version_1 = BookmarkVersion(
                     version_number=1,
                     page_range=(start_page, end_page),
@@ -440,10 +511,10 @@ class PDFConsolidator:
                 tracker.add_version(version_1)
                 self.bookmark_trackers[tracker_key] = tracker
                 
-                # Mark as having changes (so it gets version children in hierarchy)
-                self.bookmarks_with_changes.add(tracker_key)
+                # DON'T mark as having changes - it's a new bookmark, not a modified one
+                # self.bookmarks_with_changes.add(tracker_key)  # REMOVED
                 
-                print(f"      ✅ NEW bookmark added with Version 1: Pages {start_page}-{end_page} ({pages_inserted} pages)")
+                print(f"      ✅ NEW bookmark added: Pages {start_page}-{end_page} ({pages_inserted} pages)")
                 print(f"         Source pages: {', '.join(map(str, all_bookmark_pages))}")
                 print(f"         From PDF: {pdf_version}")
         

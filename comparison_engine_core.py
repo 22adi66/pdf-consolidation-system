@@ -47,6 +47,65 @@ def get_form_name(page_text: str) -> str:
     match = re.search(r"Form:\s*(.*?)\s*$", page_text, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
+def extract_bookmark_list(pdf_reader: PyPDF2.PdfReader) -> list:
+    """
+    Extracts all bookmarks from a PDF as a list of (bookmark_name, page_number) tuples.
+    This preserves ALL bookmarks, including those with duplicate names.
+    Returns list of tuples: [(bookmark_name, page_number), ...] sorted by page number.
+    """
+    # Get outlines using the modern .outline attribute
+    outlines = None
+    try:
+        # PyPDF2 v3.0.0+ uses the .outline attribute
+        outlines = pdf_reader.outline
+    except Exception:
+        outlines = None
+
+    if not outlines:
+        return []
+
+    bookmark_list = []
+
+    def _traverse_bookmarks(items):
+        for item in items:
+            # nested list indicates children
+            if isinstance(item, list):
+                _traverse_bookmarks(item)
+                continue
+
+            # try to extract title
+            title = getattr(item, "title", None) or getattr(item, "name", None) or str(item)
+
+            # try different ways to get page number
+            page_num = None
+            try:
+                # many PyPDF2 versions: Destination-like objects have .page attribute
+                page_obj = getattr(item, "page", None)
+                if page_obj is not None:
+                    page_num = pdf_reader.get_page_number(page_obj) + 1
+                else:
+                    # some versions allow get_destination_page_number
+                    if hasattr(pdf_reader, "get_destination_page_number"):
+                        try:
+                            page_num = pdf_reader.get_destination_page_number(item) + 1
+                        except Exception:
+                            page_num = None
+            except Exception:
+                page_num = None
+
+            if page_num is not None:
+                bookmark_list.append((str(title), page_num))
+
+    try:
+        _traverse_bookmarks(outlines)
+    except Exception:
+        pass
+
+    # Sort by page number
+    bookmark_list.sort(key=lambda x: x[1])
+    return bookmark_list
+
+
 def create_page_to_bookmark_map(pdf_reader: PyPDF2.PdfReader) -> list:
     """
     Creates a map from page number (1-indexed) to its corresponding bookmark title.
@@ -125,7 +184,11 @@ def create_page_to_bookmark_map(pdf_reader: PyPDF2.PdfReader) -> list:
 
     # sort by page number and fill page_map with the nearest preceding bookmark title
     bookmark_pages.sort()
-    current_title = bookmark_pages[0][1]
+    
+    # Fill page_map - each page gets the bookmark title it belongs to
+    # Important: We track each (page_num, title) pair separately, so duplicate 
+    # bookmark names are preserved as separate instances
+    current_title = bookmark_pages[0][1] if bookmark_pages else "(No Bookmark)"
     idx = 0
     for page in range(1, total_pages + 1):
         # advance bookmark index if we reach its start page
