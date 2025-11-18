@@ -276,4 +276,3 @@ GLOBAL_THRESHOLD = 0.6     # Pass 3 threshold
 
 ---
 
-**Built with full power! 🚀**
